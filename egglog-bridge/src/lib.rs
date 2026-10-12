@@ -638,11 +638,7 @@ impl EGraph {
             name,
         });
         debug_assert_eq!(res, next_func_id);
-        let incremental_rebuild_rules = self.incremental_rebuild_rules(res, &schema);
-        let nonincremental_rebuild_rule = self.nonincremental_rebuild(res, &schema);
-        let info = &mut self.funcs[res];
-        info.incremental_rebuild_rules = incremental_rebuild_rules;
-        info.nonincremental_rebuild_rule = nonincremental_rebuild_rule;
+        // Rebuild rules are built on first use; see `ensure_rebuild_rules`.
         let action = TableAction::new(self, res);
         let table_name = self.funcs[res].name.to_string();
         self.action_registry
@@ -864,6 +860,7 @@ impl EGraph {
             }
             return Ok(());
         }
+        self.ensure_rebuild_rules();
         if do_parallel {
             return self.rebuild_parallel();
         }
@@ -1015,6 +1012,30 @@ impl EGraph {
         }
         log::info!("rebuild took {:?}", start.elapsed());
         Ok(())
+    }
+
+    /// Build the rebuild rules of every function that does not have them yet.
+    ///
+    /// Only rebuilding against a union-find without native rebuild support
+    /// runs these rules, so they are built the first time that happens
+    /// rather than when each function is added. A term-encoded program
+    /// declares tens of thousands of functions, and each would otherwise
+    /// carry compiled rules that never run.
+    fn ensure_rebuild_rules(&mut self) {
+        let pending: Vec<FunctionId> = self
+            .funcs
+            .iter()
+            .filter(|(_, info)| info.nonincremental_rebuild_rule == RuleId::new(!0))
+            .map(|(func, _)| func)
+            .collect();
+        for func in pending {
+            let schema = self.funcs[func].schema.clone();
+            let incremental_rebuild_rules = self.incremental_rebuild_rules(func, &schema);
+            let nonincremental_rebuild_rule = self.nonincremental_rebuild(func, &schema);
+            let info = &mut self.funcs[func];
+            info.incremental_rebuild_rules = incremental_rebuild_rules;
+            info.nonincremental_rebuild_rule = nonincremental_rebuild_rule;
+        }
     }
 
     fn incremental_rebuild_rules(&mut self, table: FunctionId, schema: &[ColumnTy]) -> Vec<RuleId> {
