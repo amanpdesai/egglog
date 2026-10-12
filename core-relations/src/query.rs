@@ -10,7 +10,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
-    BaseValueId, CounterId, ExternalFunctionId, PoolSet,
+    BaseValueId, CounterId, ExternalFunctionId, PoolSet, SortedWritesTable, Subset, SubsetRef,
+    TaggedRowBuffer, Value,
     action::{Instr, QueryEntry, WriteVal},
     common::HashMap,
     free_join::{
@@ -19,7 +20,7 @@ use crate::{
         plan::{JoinHeader, Plan, PlanStrategy},
     },
     pool::{Pooled, with_pool_set},
-    table_spec::{ColumnId, Constraint},
+    table_spec::{ColumnId, Constraint, Offset},
 };
 
 define_id!(pub RuleId, u32, "An identifier for a rule in a rule set");
@@ -38,6 +39,40 @@ pub struct CachedPlan {
     desc: Arc<str>,
     symbol_map: SymbolMap,
     actions: ActionInfo,
+}
+
+impl CachedPlan {
+    /// The table that `atom` of this plan reads.
+    pub fn atom_table(&self, atom: AtomId) -> TableId {
+        self.plan.atoms_ref()[atom].table
+    }
+
+    /// Whether the plan restricts its atoms with constraints of its own, so
+    /// that a variant can select no rows even when its extra constraints do.
+    pub fn has_cached_constraints(&self) -> bool {
+        !self.plan.header().is_empty()
+    }
+
+    /// The columns of `small` that bind the key of `keyed`, in key order, if
+    /// `keyed` reads a [`SortedWritesTable`] (which has one live row per key)
+    /// and `small` binds every key column with a variable.
+    pub fn key_join(
+        &self,
+        db: &Database,
+        small: AtomId,
+        keyed: AtomId,
+    ) -> Option<SmallVec<[ColumnId; 4]>> {
+        let atoms = self.plan.atoms_ref();
+        let (small, keyed) = (&atoms[small], &atoms[keyed]);
+        let keyed_info = db.get_table_info(keyed.table);
+        keyed_info
+            .table
+            .as_any()
+            .downcast_ref::<SortedWritesTable>()?;
+        (0..keyed_info.spec.n_keys)
+            .map(|col| small.get_col(keyed.get_var(ColumnId::from_usize(col))?))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +95,12 @@ pub struct RuleSet {
     /// complex.
     pub(crate) plans: IdVec<RuleId, (Plan, Arc<str> /* description */, SymbolMap)>,
     pub(crate) actions: DenseIdMap<ActionId, ActionInfo>,
+    /// Descriptions of rules dropped because a key lookup showed they match
+    /// nothing. Each is reported as a run with no matches, as if executed.
+    pub(crate) unmatched: Vec<Arc<str>>,
+    /// Whether a rule that would have run was left out, so running this set
+    /// must still merge pending updates as running that rule would have.
+    pub(crate) left_out: bool,
 }
 
 impl RuleSet {
@@ -94,6 +135,35 @@ impl RuleSet {
 pub struct RuleSetBuilder<'outer> {
     rule_set: RuleSet,
     db: &'outer mut Database,
+    unmatched: UnmatchedRules,
+}
+
+/// What [`RuleSetBuilder::add_rule_from_cached_plan`] does with a rule that a
+/// key lookup shows matches nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnmatchedRules {
+    /// Add it, and run it.
+    #[default]
+    Run,
+    /// Leave it out, and report it as run with no matches and no plan.
+    Report,
+    /// Leave it out of the rule set and its report.
+    Drop,
+}
+
+/// The most candidate rows [`RuleSetBuilder::key_lookup_rules_out`] scans in
+/// one atom.
+const SMALL_ATOM_ROWS: usize = 4;
+
+fn satisfies(constraints: &[Constraint], row: &[Value]) -> bool {
+    constraints.iter().all(|c| match c {
+        Constraint::Eq { l_col, r_col } => row[l_col.index()] == row[r_col.index()],
+        Constraint::EqConst { col, val } => row[col.index()] == *val,
+        Constraint::LtConst { col, val } => row[col.index()] < *val,
+        Constraint::GtConst { col, val } => row[col.index()] > *val,
+        Constraint::LeConst { col, val } => row[col.index()] <= *val,
+        Constraint::GeConst { col, val } => row[col.index()] >= *val,
+    })
 }
 
 impl<'outer> RuleSetBuilder<'outer> {
@@ -101,6 +171,84 @@ impl<'outer> RuleSetBuilder<'outer> {
         Self {
             rule_set: Default::default(),
             db,
+            unmatched: UnmatchedRules::Run,
+        }
+    }
+
+    /// The keys of the live rows of `atom`'s table in `cached`, flattened in
+    /// the order of `key_cols`, or `None` if it has more than
+    /// [`SMALL_ATOM_ROWS`] live rows.
+    pub fn small_atom_keys(
+        &self,
+        cached: &CachedPlan,
+        atom: AtomId,
+        key_cols: &[ColumnId],
+    ) -> Option<SmallVec<[Value; 4]>> {
+        let info = self.db.get_table_info(cached.atom_table(atom));
+        if info.table.len() > SMALL_ATOM_ROWS {
+            return None;
+        }
+        let mut rows = TaggedRowBuffer::new(info.spec.arity());
+        info.table.scan_bounded(
+            info.table.all().as_ref(),
+            Offset::new(0),
+            usize::MAX,
+            &mut rows,
+        );
+        Some(
+            rows.non_stale()
+                .flat_map(|(_, row)| key_cols.iter().map(|col| row[col.index()]))
+                .collect(),
+        )
+    }
+
+    /// Whether some key tuple in `keys` (key tuples of `table`, flattened)
+    /// has a live row in `table` that meets `constraint`, or `None` if
+    /// `constraint` compares two columns or `table` has no key columns.
+    pub fn any_key_meets(
+        &self,
+        table: TableId,
+        constraint: &Constraint,
+        keys: &[Value],
+    ) -> Option<bool> {
+        let info = self.db.get_table_info(table);
+        let n_keys = info.spec.n_keys;
+        let (col, val, meets): (ColumnId, Value, fn(Value, Value) -> bool) = match *constraint {
+            Constraint::Eq { .. } => return None,
+            Constraint::EqConst { col, val } => (col, val, |x, c| x == c),
+            Constraint::LtConst { col, val } => (col, val, |x, c| x < c),
+            Constraint::GtConst { col, val } => (col, val, |x, c| x > c),
+            Constraint::LeConst { col, val } => (col, val, |x, c| x <= c),
+            Constraint::GeConst { col, val } => (col, val, |x, c| x >= c),
+        };
+        if n_keys == 0 {
+            return None;
+        }
+        Some(keys.chunks(n_keys).any(|key| {
+            info.table
+                .get_row_column(key, col)
+                .is_some_and(|x| meets(x, val))
+        }))
+    }
+
+    /// Set what [`RuleSetBuilder::add_rule_from_cached_plan`] does with a rule
+    /// that a key lookup shows matches nothing.
+    pub fn unmatched_rules(&mut self, unmatched: UnmatchedRules) {
+        self.unmatched = unmatched;
+    }
+
+    /// What [`RuleSetBuilder::add_rule_from_cached_plan`] does with a rule
+    /// that a key lookup shows matches nothing.
+    pub fn unmatched_rules_mode(&self) -> UnmatchedRules {
+        self.unmatched
+    }
+
+    /// Leave out `cached`, which a key lookup shows matches nothing, as
+    /// [`RuleSetBuilder::unmatched_rules`] says.
+    pub fn leave_out(&mut self, cached: &CachedPlan) {
+        self.rule_set.left_out = true;
+        if self.unmatched == UnmatchedRules::Report {
+            self.rule_set.unmatched.push(cached.desc.clone());
         }
     }
 
@@ -236,6 +384,153 @@ impl<'outer> RuleSetBuilder<'outer> {
         }
     }
 
+    /// Whether a key lookup from a small atom shows that `atoms` have no match
+    /// under `restrictions`, each an atom with a superset of the rows it may
+    /// match and constraints those rows meet.
+    ///
+    /// Take an atom with at most [`SMALL_ATOM_ROWS`] candidate rows and a
+    /// restricted atom over a [`SortedWritesTable`] whose key columns hold
+    /// variables the small atom binds. Every match pairs a live row of the
+    /// small atom with the one live row at the key it binds, and that row
+    /// meets the keyed atom's constraints. If no small row finds such a row,
+    /// nothing matches. A term-encoding rebuild rule for a one-row view joins
+    /// it with the few union-find rows written since its last run; this
+    /// rejects it without running the join.
+    fn key_lookup_rules_out(
+        &self,
+        atoms: &DenseIdMap<AtomId, Atom>,
+        restrictions: &[(AtomId, SubsetRef<'_>, &[Constraint])],
+    ) -> bool {
+        for (small_id, small) in atoms.iter() {
+            let small_info = self.db.get_table_info(small.table);
+            let small_restrictions = || restrictions.iter().filter(move |r| r.0 == small_id);
+            let all;
+            let candidates = match small_restrictions().min_by_key(|r| r.1.size()) {
+                Some((_, subset, _)) => *subset,
+                None => {
+                    all = small_info.table.all();
+                    all.as_ref()
+                }
+            };
+            if candidates.size() > SMALL_ATOM_ROWS {
+                continue;
+            }
+            let mut rows = None;
+            for (keyed_id, keyed) in atoms.iter() {
+                let keyed_restrictions = || restrictions.iter().filter(move |r| r.0 == keyed_id);
+                if keyed_id == small_id || keyed_restrictions().next().is_none() {
+                    continue;
+                }
+                let keyed_info = self.db.get_table_info(keyed.table);
+                if keyed_info
+                    .table
+                    .as_any()
+                    .downcast_ref::<SortedWritesTable>()
+                    .is_none()
+                {
+                    continue;
+                }
+                let Some(key_cols) = (0..keyed_info.spec.n_keys)
+                    .map(|col| small.get_col(keyed.get_var(ColumnId::from_usize(col))?))
+                    .collect::<Option<SmallVec<[ColumnId; 4]>>>()
+                else {
+                    continue;
+                };
+                let rows = rows.get_or_insert_with(|| {
+                    let mut rows = TaggedRowBuffer::new(small_info.spec.arity());
+                    small_info.table.scan_bounded(
+                        candidates,
+                        Offset::new(0),
+                        usize::MAX,
+                        &mut rows,
+                    );
+                    rows
+                });
+                let mut key = SmallVec::<[Value; 4]>::new();
+                let may_match = rows.non_stale().any(|(_, row)| {
+                    if !small_restrictions().all(|r| satisfies(r.2, row)) {
+                        return false;
+                    }
+                    key.clear();
+                    key.extend(key_cols.iter().map(|col| row[col.index()]));
+                    keyed_info.table.get_row(&key).is_some_and(|found| {
+                        keyed_restrictions().all(|r| satisfies(r.2, &found.vals))
+                    })
+                });
+                if !may_match {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The rows of `table` that `constraint` selects, computed as
+    /// [`Database::process_constraints`] does, if it is a fast constraint.
+    fn fast_subset(&self, table: TableId, constraint: &Constraint) -> Option<Subset> {
+        let table = self.db.get_table(table);
+        let fast = table.fast_subset(constraint)?;
+        let mut subset = table.all();
+        with_pool_set(|ps| subset.intersect(fast.as_ref(), &ps.get_pool()));
+        Some(subset)
+    }
+
+    /// Whether to drop `cached` under `extra_constraints` because a key
+    /// lookup shows it matches nothing, decided before building its headers.
+    ///
+    /// Only plans without cached headers qualify: their variant is empty
+    /// exactly when an extra constraint selects no rows, so a dropped rule is
+    /// one that would otherwise have run.
+    fn drop_before_headers(
+        &self,
+        cached: &CachedPlan,
+        extra_constraints: &[(AtomId, Constraint)],
+    ) -> bool {
+        if self.unmatched == UnmatchedRules::Run || !cached.plan.header().is_empty() {
+            return false;
+        }
+        let mut subsets = SmallVec::<[(AtomId, Subset, &Constraint); 4]>::new();
+        for (atom, constraint) in extra_constraints {
+            let Some(subset) = self.fast_subset(cached.atom_table(*atom), constraint) else {
+                return false;
+            };
+            if subset.size() == 0 {
+                return false;
+            }
+            subsets.push((*atom, subset, constraint));
+        }
+        let restrictions: SmallVec<[_; 4]> = subsets
+            .iter()
+            .map(|(atom, subset, constraint)| {
+                (*atom, subset.as_ref(), std::slice::from_ref(*constraint))
+            })
+            .collect();
+        self.key_lookup_rules_out(cached.plan.atoms_ref(), &restrictions)
+    }
+
+    /// Whether the rows of `table` may have changed since
+    /// [`Database::change_epoch`] returned `epoch`.
+    pub fn changed_since(&self, table: TableId, epoch: u64) -> bool {
+        self.db.changed_since(table, epoch)
+    }
+
+    /// The database's [`Database::change_epoch`].
+    pub fn change_epoch(&self) -> u64 {
+        self.db.change_epoch()
+    }
+
+    /// Whether `constraint` selects no rows of `table`.
+    ///
+    /// If so, [`RuleSetBuilder::add_rule_from_cached_plan`] returns `None` for
+    /// any constraint list that puts it on an atom over `table`, so a caller
+    /// can test this before assembling the rest of the list.
+    pub fn constraint_is_empty(&self, table: TableId, constraint: &Constraint) -> bool {
+        self.db
+            .get_table(table)
+            .fast_subset(constraint)
+            .is_some_and(|subset| subset.size() == 0)
+    }
+
     /// Add a rule to this rule set based on a previously cached plan, optionally
     /// with additional constraints applied on top.
     ///
@@ -256,7 +551,22 @@ impl<'outer> RuleSetBuilder<'outer> {
         // Peek at the action_id without allocating it yet, so we don't break
         // the rules<->actions bijection if the query turns out to be empty.
         let action_id = self.rule_set.actions.next_id();
+        if self.drop_before_headers(cached, extra_constraints) {
+            self.leave_out(cached);
+            return None;
+        }
         let plan = self.get_rule_with_extra_constraints(cached, action_id, extra_constraints)?;
+        if self.unmatched != UnmatchedRules::Run && !cached.plan.header().is_empty() {
+            let restrictions: SmallVec<[_; 4]> = plan
+                .header()
+                .iter()
+                .map(|h| (h.atom, h.subset.as_ref(), &h.constraints[..]))
+                .collect();
+            if self.key_lookup_rules_out(plan.atoms_ref(), &restrictions) {
+                self.leave_out(cached);
+                return None;
+            }
+        }
         // The query is non-empty: now commit the action and the plan.
         let actual_action_id = self.rule_set.actions.push(cached.actions.clone());
         debug_assert_eq!(action_id, actual_action_id);

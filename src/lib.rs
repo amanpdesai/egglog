@@ -1171,16 +1171,20 @@ impl EGraph {
         let mut rule_ids = Vec::new();
         collect_rule_ids(ruleset, &self.rulesets, &mut rule_ids);
 
-        let mut iteration_report = self
-            .backend
-            .run_rules(&rule_ids, Some(&self.type_info))
-            .map_err(|e| Error::BackendError(e.to_string()))?;
-
         // The term encoding's maintenance rulesets hold rules for every
         // function and run after every command, so a report entry per rule
         // per run grows with commands times functions. Keep the rules that
         // matched.
-        if self.is_encoding_ruleset(ruleset) {
+        let encoding_ruleset = self.is_encoding_ruleset(ruleset);
+        let mut iteration_report = if encoding_ruleset {
+            self.backend
+                .run_rules_reporting_matches(&rule_ids, Some(&self.type_info))
+        } else {
+            self.backend.run_rules(&rule_ids, Some(&self.type_info))
+        }
+        .map_err(|e| Error::BackendError(e.to_string()))?;
+
+        if encoding_ruleset {
             let rule_reports = &mut iteration_report.rule_set_report.rule_reports;
             rule_reports.retain(|_, reports| reports.iter().any(|r| r.num_matches > 0));
             rule_reports.shrink_to_fit();

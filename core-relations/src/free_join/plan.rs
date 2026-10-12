@@ -234,6 +234,13 @@ impl Plan {
         }
     }
 
+    pub(crate) fn atoms_ref(&self) -> &DenseIdMap<AtomId, Atom> {
+        match self {
+            Plan::SinglePlan(p) => &p.atoms,
+            Plan::DecomposedPlan(p) => &p.atoms,
+        }
+    }
+
     pub(crate) fn to_report(&self, _symbol_map: &SymbolMap) -> egglog_reports::Plan {
         match self {
             Plan::SinglePlan(p) => p.to_report(_symbol_map),

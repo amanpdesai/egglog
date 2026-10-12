@@ -451,6 +451,11 @@ pub struct Database {
     /// This is primarily used to determine whether or not to attempt to do some operations in
     /// parallel.
     total_size_estimate: usize,
+    /// Counts the times any table's rows may have changed. See
+    /// [`Database::change_epoch`].
+    change_epoch: u64,
+    /// The `change_epoch` at which each table's rows last may have changed.
+    table_epochs: DenseIdMap<TableId, u64>,
 }
 
 impl Database {
@@ -460,6 +465,28 @@ impl Database {
     /// installed, queries run single-threaded.
     pub fn new() -> Database {
         Database::default()
+    }
+
+    /// A counter that increases whenever the rows of some table may change.
+    ///
+    /// A table for which [`Database::changed_since`] is false at an epoch read
+    /// earlier has had no row added, removed, or rewritten since that read.
+    pub fn change_epoch(&self) -> u64 {
+        self.change_epoch
+    }
+
+    /// Whether the rows of `table` may have changed since
+    /// [`Database::change_epoch`] returned `epoch`.
+    pub fn changed_since(&self, table: TableId, epoch: u64) -> bool {
+        self.table_epochs
+            .get(table)
+            .is_none_or(|changed| *changed > epoch)
+    }
+
+    /// Record that the rows of `table` may change.
+    fn note_change(&mut self, table: TableId) {
+        self.change_epoch += 1;
+        self.table_epochs.insert(table, self.change_epoch);
     }
 
     /// Initialize a new rulse set to run against this database.
@@ -557,6 +584,9 @@ impl Database {
         table_ids: &[TableId],
         run: impl for<'a> Fn(TableId, &mut TableInfo, &DbView<'a>) -> bool + Sync,
     ) {
+        for id in table_ids {
+            self.note_change(*id);
+        }
         if parallelize_db_level_op(self.total_size_estimate) {
             let mut tables = Vec::with_capacity(table_ids.len());
             for id in table_ids {
@@ -786,6 +816,7 @@ impl Database {
         // `total_size_estimate` was maintained incrementally at each merge (above and
         // in `merge_simple`), so we no longer re-sum every table here.
         for table in touched.iter().copied() {
+            self.note_change(table);
             if let Some(info) = self.tables.get_mut(table) {
                 info.column_indexes.update(|_, ti| {
                     Arc::get_mut(ti).unwrap().reset();
@@ -831,6 +862,7 @@ impl Database {
     /// elesewhere. The `merge_all` method runs merges to a fixed point to avoid
     /// surprises here.
     pub fn merge_table(&mut self, table: TableId) -> bool {
+        self.note_change(table);
         let mut info = self.tables.unwrap_val(table);
         self.total_size_estimate = self.total_size_estimate.wrapping_sub(info.table.len());
         let table_changed = info.table.merge(&mut ExecutionState::new(
@@ -892,6 +924,7 @@ impl Database {
             successor_families: HashMap::default(),
         });
         self.deps.add_table(res, read_deps, write_deps);
+        self.note_change(res);
         res
     }
 
@@ -989,6 +1022,7 @@ impl Database {
     /// **NOTE:** See the warning around staging updates to handles returned through this method in
     /// the documentation for [`Database::get_table`].
     pub fn get_table_mut(&mut self, id: TableId) -> &mut dyn Table {
+        self.note_change(id);
         &mut *self
             .tables
             .get_mut(id)
@@ -1014,6 +1048,7 @@ impl Database {
     /// caller's responsibility to call [`Database::merge_all`] beforehand if
     /// they need staged updates from a previous step to land before the clear.
     pub fn clear_table(&mut self, table: TableId) {
+        self.note_change(table);
         let info = self
             .tables
             .get_mut(table)

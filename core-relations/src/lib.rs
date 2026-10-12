@@ -38,6 +38,7 @@ pub use offsets::{OffsetRange, RowId, Subset, SubsetRef};
 pub use pool::{Pool, PoolSet, Pooled};
 pub use query::{
     CachedPlan, QueryBuilder, QueryError, RuleBuilder, RuleId, RuleSet, RuleSetBuilder,
+    UnmatchedRules,
 };
 pub use row_buffer::TaggedRowBuffer;
 pub use table::{MergeFn, SortedWritesTable};

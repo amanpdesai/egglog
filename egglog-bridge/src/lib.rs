@@ -20,7 +20,7 @@ use crate::core_relations::{
     BaseValue, BaseValueId, BaseValues, ColumnId, Constraint, ContainerValue, ContainerValues,
     CounterId, Database, DisplacedTable, ExecutionState, ExternalContext, ExternalFunction,
     ExternalFunctionId, MergeVal, Offset, PlanStrategy, SortedWritesTable, TableId, TableIdentity,
-    TaggedRowBuffer, Value, WrappedTable,
+    TaggedRowBuffer, UnmatchedRules, Value, WrappedTable,
 };
 use crate::numeric_id::{DenseIdMap, DenseIdMapWithReuse, NumericId, define_id};
 use egglog_concurrency::ThreadPool;
@@ -125,6 +125,9 @@ pub struct EGraph {
     uf_table: TableId,
     id_counter: CounterId,
     timestamp_counter: CounterId,
+    /// The database's change epoch when the timestamp counter last advanced.
+    /// Rows stamped with the current timestamp change their tables after it.
+    ts_epoch: u64,
     rules: DenseIdMapWithReuse<RuleId, RuleInfo>,
     funcs: DenseIdMap<FunctionId, FunctionInfo>,
     panic_message: SideChannel<String>,
@@ -240,11 +243,13 @@ impl EGraph {
             default_panic_id,
         )));
 
+        let ts_epoch = db.change_epoch();
         Self {
             db,
             uf_table,
             id_counter,
             timestamp_counter: ts_counter,
+            ts_epoch,
             rules: Default::default(),
             funcs: Default::default(),
             panic_message,
@@ -286,6 +291,7 @@ impl EGraph {
 
     fn inc_ts(&mut self) {
         self.db.inc_counter(self.timestamp_counter);
+        self.ts_epoch = self.db.change_epoch();
     }
 
     /// Get a mutable reference to the underlying table of base values for this
@@ -675,7 +681,26 @@ impl EGraph {
         context: ExternalContext<'_>,
     ) -> Result<IterationReport> {
         let thread_pool = self.thread_pool();
-        install_thread_pool(thread_pool, || self.run_rules_inner(rules, context))
+        install_thread_pool(thread_pool, || {
+            self.run_rules_inner(rules, context, ReportUnmatched::Yes)
+        })
+    }
+
+    /// Run `rules` like [`EGraph::run_rules`], except that the report may
+    /// leave out rules that matched nothing.
+    ///
+    /// Rules that cheap checks show cannot match are then neither run nor
+    /// reported, which keeps runs of large rulesets whose rules rarely match
+    /// from paying per rule.
+    pub fn run_rules_reporting_matches(
+        &mut self,
+        rules: &[RuleId],
+        context: ExternalContext<'_>,
+    ) -> Result<IterationReport> {
+        let thread_pool = self.thread_pool();
+        install_thread_pool(thread_pool, || {
+            self.run_rules_inner(rules, context, ReportUnmatched::No)
+        })
     }
 
     /// Run `rules` for one iteration like [`EGraph::run_rules`], but without
@@ -701,7 +726,9 @@ impl EGraph {
                 &mut self.rules,
                 rules,
                 ts,
+                self.ts_epoch,
                 self.report_level,
+                ReportUnmatched::Yes,
                 context,
             )?;
             if let Some(message) = self.panic_message.lock().unwrap().take() {
@@ -745,6 +772,7 @@ impl EGraph {
         &mut self,
         rules: &[RuleId],
         context: ExternalContext<'_>,
+        report_unmatched: ReportUnmatched,
     ) -> Result<IterationReport> {
         let ts = self.next_ts();
 
@@ -754,7 +782,9 @@ impl EGraph {
             &mut self.rules,
             rules,
             ts,
+            self.ts_epoch,
             self.report_level,
+            report_unmatched,
             context,
         )?;
         let panic_message = self.panic_message.lock().unwrap().take();
@@ -874,6 +904,7 @@ impl EGraph {
             // should look only at the latest updates.
             self.inc_ts();
             let ts = self.next_ts();
+            let ts_epoch = self.ts_epoch;
             for (_, info) in self.funcs.iter_mut() {
                 let last_rebuilt_at = self.rules[info.nonincremental_rebuild_rule].last_run_at;
                 let table_size = self.db.estimate_size(info.table, None);
@@ -896,7 +927,9 @@ impl EGraph {
                                 &mut self.rules,
                                 &[*rule],
                                 ts,
+                                ts_epoch,
                                 ReportLevel::TimeOnly,
+                                ReportUnmatched::Yes,
                                 None,
                             )?
                             .changed;
@@ -912,7 +945,9 @@ impl EGraph {
                             &mut self.rules,
                             &[info.nonincremental_rebuild_rule],
                             ts,
+                            ts_epoch,
                             ReportLevel::TimeOnly,
+                            ReportUnmatched::Yes,
                             None,
                         )?
                         .changed;
@@ -975,6 +1010,7 @@ impl EGraph {
                 }
             }
             let ts = self.next_ts();
+            let ts_epoch = self.ts_epoch;
             for func in state.nonincremental.iter().copied() {
                 scratch.push(self.funcs[func].nonincremental_rebuild_rule);
                 for rule in &self.funcs[func].incremental_rebuild_rules {
@@ -986,12 +1022,15 @@ impl EGraph {
                 &mut self.rules,
                 &scratch,
                 ts,
+                ts_epoch,
                 ReportLevel::TimeOnly,
+                ReportUnmatched::Yes,
                 None,
             )?
             .changed;
             scratch.clear();
             let ts = self.next_ts();
+            let ts_epoch = self.ts_epoch;
             for (i, funcs) in state.incremental.iter() {
                 for func in funcs.iter().copied() {
                     let info = &mut self.funcs[func];
@@ -1003,7 +1042,9 @@ impl EGraph {
                     &mut self.rules,
                     &scratch,
                     ts,
+                    ts_epoch,
                     ReportLevel::TimeOnly,
+                    ReportUnmatched::Yes,
                     None,
                 )?
                 .changed;
@@ -1201,6 +1242,13 @@ impl EGraph {
 #[derive(Clone)]
 struct RuleInfo {
     last_run_at: Timestamp,
+    /// A timestamp this rule ran at and the change epoch at which the
+    /// timestamp counter reached it. When the timestamp is `last_run_at`,
+    /// tables unchanged since the epoch hold no rows from that run on.
+    run_epoch: (Timestamp, u64),
+    /// For a two-atom rule, per focus atom, the join keys of the other atom's
+    /// rows. See [`CachedPlanInfo::key_joins`].
+    routes: [Option<Route>; 2],
     query: rule::Query,
     cached_plan: Option<CachedPlanInfo>,
     desc: Arc<str>,
@@ -1211,7 +1259,23 @@ struct CachedPlanInfo {
     plan: Arc<core_relations::CachedPlan>,
     /// A mapping from index into a [`rule::Query`]'s atoms to the atoms in the underlying cached
     /// plan.
-    atom_mapping: Vec<core_relations::AtomId>,
+    atom_mapping: SmallVec<[core_relations::AtomId; 4]>,
+    /// For each atom, the table it reads and that table's timestamp column.
+    atom_ts: SmallVec<[(TableId, ColumnId); 4]>,
+    /// For a two-atom rule without cached constraints, per focus atom, the
+    /// columns of the other atom that bind the focus atom's key, if they bind
+    /// all of it.
+    key_joins: [Option<SmallVec<[ColumnId; 4]>>; 2],
+}
+
+/// The join keys of a small atom's rows, as of a database change epoch. While
+/// the atom's table is unchanged since the epoch, a seminaive variant whose
+/// new rows hold none of these keys matches nothing.
+#[derive(Clone)]
+struct Route {
+    epoch: u64,
+    /// `None` if the atom's table had too many rows to keep.
+    keys: Option<SmallVec<[Value; 4]>>,
 }
 
 #[derive(Clone)]
@@ -1744,12 +1808,22 @@ impl UnionAction {
     }
 }
 
+/// Whether a run's report must list rules that matched nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReportUnmatched {
+    Yes,
+    No,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_rules_impl(
     db: &mut Database,
     rule_info: &mut DenseIdMapWithReuse<RuleId, RuleInfo>,
     rules: &[RuleId],
     next_ts: Timestamp,
+    ts_epoch: u64,
     report_level: ReportLevel,
+    report_unmatched: ReportUnmatched,
     context: ExternalContext<'_>,
 ) -> Result<RuleSetReport> {
     for rule in rules {
@@ -1759,12 +1833,30 @@ fn run_rules_impl(
         }
     }
     let mut rsb = db.new_rule_set();
+    rsb.unmatched_rules(match (report_unmatched, report_level) {
+        (ReportUnmatched::No, _) => UnmatchedRules::Drop,
+        // A rule left out is reported without a plan, so keep every plan when
+        // the report asks for them.
+        (ReportUnmatched::Yes, ReportLevel::TimeOnly) => UnmatchedRules::Report,
+        (ReportUnmatched::Yes, _) => UnmatchedRules::Run,
+    });
+    // Rules of one ruleset share tables and timestamps, so test each table's
+    // new rows once.
+    let mut has_new_rows = HashMap::default();
     for rule in rules {
         let info = &mut rule_info[*rule];
         let cached_plan = info.cached_plan.as_ref().unwrap();
-        info.query
-            .add_rules_from_cached(&mut rsb, info.last_run_at, cached_plan);
+        let (epoch_ts, epoch) = info.run_epoch;
+        info.query.add_rules_from_cached(
+            &mut rsb,
+            info.last_run_at,
+            (epoch_ts == info.last_run_at).then_some(epoch),
+            cached_plan,
+            &mut has_new_rows,
+            &mut info.routes,
+        );
         info.last_run_at = next_ts;
+        info.run_epoch = (next_ts, ts_epoch);
     }
     let ruleset = rsb.build();
     Ok(db.run_rule_set(&ruleset, report_level, context))

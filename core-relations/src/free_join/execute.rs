@@ -22,7 +22,7 @@ use dashmap::mapref::{entry::Entry, one::RefMut};
 use egglog_concurrency::{Scope, SharedArena};
 use egglog_reports::{ReportLevel, RuleReport, RuleSetReport};
 use smallvec::SmallVec;
-use web_time::Instant;
+use web_time::{Duration, Instant};
 
 use crate::{
     Constraint, OffsetRange, Pool, SubsetRef,
@@ -172,7 +172,7 @@ impl Database {
         report_level: ReportLevel,
         context: ExternalContext<'_>,
     ) -> RuleSetReport {
-        if rule_set.plans.is_empty() {
+        if rule_set.plans.is_empty() && !rule_set.left_out {
             return RuleSetReport::default();
         }
         let match_counter = Arc::new(MatchCounter::new(rule_set.actions.n_ids()));
@@ -506,6 +506,16 @@ impl Database {
             action_buf.flush(&mut exec_state.clone());
         }
 
+        for desc in &rule_set.unmatched {
+            rule_reports
+                .entry(desc.clone())
+                .or_default()
+                .push(RuleReport {
+                    plan: None,
+                    search_and_apply_time: Duration::ZERO,
+                    num_matches: 0,
+                });
+        }
         for (plan, desc, _symbol_map) in rule_set.plans.values() {
             let reports = rule_reports.get_mut(desc).unwrap();
             let i = reports

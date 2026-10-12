@@ -9,16 +9,16 @@ use std::sync::Arc;
 use crate::core_relations;
 use crate::core_relations::{
     ColumnId, Constraint, CounterId, ExternalFunctionId, PlanStrategy, QueryBuilder,
-    RuleBuilder as CoreRuleBuilder, RuleSetBuilder, TableId, Value, WriteVal,
+    RuleBuilder as CoreRuleBuilder, RuleSetBuilder, TableId, UnmatchedRules, Value, WriteVal,
 };
 use crate::numeric_id::{DenseIdMap, NumericId, define_id};
 use anyhow::Context;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use log::debug;
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::{CachedPlanInfo, NOT_SUBSUMED, RowVals, SUBSUMED, SchemaMath};
+use crate::{CachedPlanInfo, NOT_SUBSUMED, Route, RowVals, SUBSUMED, SchemaMath};
 use crate::{ColumnTy, DefaultVal, EGraph, FunctionId, Result, RuleId, RuleInfo, Timestamp};
 
 define_id!(pub VariableId, u32, "A variable in an egglog query");
@@ -298,6 +298,8 @@ impl RuleBuilder<'_> {
         let res = self.query.rule_id;
         let info = RuleInfo {
             last_run_at: Timestamp::new(0),
+            run_epoch: (Timestamp::new(0), 0),
+            routes: [None, None],
             query: self.query,
             cached_plan: None,
             desc: self.desc,
@@ -750,14 +752,36 @@ impl Query {
     ) -> Result<CachedPlanInfo> {
         let mut rsb = RuleSetBuilder::new(db);
         let (mut qb, mut inner) = self.query_state(&mut rsb);
-        let mut atom_mapping = Vec::with_capacity(self.atoms.len());
+        let mut atom_mapping = SmallVec::with_capacity(self.atoms.len());
         for (table, entries, _schema_info) in &self.atoms {
             atom_mapping.push(add_atom(&mut qb, *table, entries, &[], &mut inner)?);
         }
         let rule_id = self.run_rules_and_build(qb, inner, desc)?;
         let rs = rsb.build();
         let plan = Arc::new(rs.build_cached_plan(rule_id));
-        Ok(CachedPlanInfo { plan, atom_mapping })
+        let atom_ts = atom_mapping
+            .iter()
+            .zip(&self.atoms)
+            .map(|(atom, (_, _, schema_info))| {
+                (
+                    plan.atom_table(*atom),
+                    ColumnId::from_usize(schema_info.ts_col()),
+                )
+            })
+            .collect();
+        let key_joins = match atom_mapping[..] {
+            [first, second] if !plan.has_cached_constraints() => [
+                plan.key_join(db, second, first),
+                plan.key_join(db, first, second),
+            ],
+            _ => [None, None],
+        };
+        Ok(CachedPlanInfo {
+            plan,
+            atom_mapping,
+            atom_ts,
+            key_joins,
+        })
     }
 
     /// Add rules to the [`RuleSetBuilder`] for the query specified by the [`CachedPlanInfo`].
@@ -770,7 +794,10 @@ impl Query {
         &self,
         rsb: &mut RuleSetBuilder,
         mid_ts: Timestamp,
+        mid_epoch: Option<u64>,
         cached_plan: &CachedPlanInfo,
+        has_new_rows: &mut HashMap<(TableId, ColumnId, Timestamp), bool>,
+        routes: &mut [Option<Route>; 2],
     ) {
         // For N atoms, we create N queries for seminaive evaluation. We can reuse the cached plan
         // directly.
@@ -778,20 +805,29 @@ impl Query {
             let _ = rsb.add_rule_from_cached_plan(&cached_plan.plan, &[]);
             return;
         }
+        // A variant whose focus atom has no new rows matches nothing, and
+        // `add_rule_from_cached_plan` would reject it. Maintenance rulesets
+        // hold many rules over tables that rarely change, so test that first.
+        let mut focus = |rsb: &RuleSetBuilder, atom: usize| {
+            let (table, col) = cached_plan.atom_ts[atom];
+            // A table unchanged since `mid_ts` began holds no rows from it.
+            if mid_epoch.is_some_and(|epoch| !rsb.changed_since(table, epoch)) {
+                return None;
+            }
+            let constraint = Constraint::GeConst {
+                col,
+                val: mid_ts.to_value(),
+            };
+            let has_new = *has_new_rows
+                .entry((table, col, mid_ts))
+                .or_insert_with(|| !rsb.constraint_is_empty(table, &constraint));
+            has_new.then_some((cached_plan.atom_mapping[atom], constraint))
+        };
         if let Some(focus_atom) = self.sole_focus {
             // There is a single "focus" atom that we will constrain to look at new values.
-            let (_, _, schema_info) = &self.atoms[focus_atom];
-            let ts_col = ColumnId::from_usize(schema_info.ts_col());
-            let _ = rsb.add_rule_from_cached_plan(
-                &cached_plan.plan,
-                &[(
-                    cached_plan.atom_mapping[focus_atom],
-                    Constraint::GeConst {
-                        col: ts_col,
-                        val: mid_ts.to_value(),
-                    },
-                )],
-            );
+            if let Some(constraint) = focus(rsb, focus_atom) {
+                let _ = rsb.add_rule_from_cached_plan(&cached_plan.plan, &[constraint]);
+            }
             return;
         }
         // Use the cached plan atoms.len() times with different constraints on each atom.
@@ -800,33 +836,54 @@ impl Query {
         //
         //     A_new x B x C + A_old x B_new x C + A_old x B_old x C_new
         //
-        let mut constraints: Vec<(core_relations::AtomId, Constraint)> =
-            Vec::with_capacity(self.atoms.len());
+        let mut constraints = SmallVec::<[(core_relations::AtomId, Constraint); 4]>::new();
         'outer: for focus_atom in 0..self.atoms.len() {
-            constraints.clear();
-            // start with the focus atom since `add_rule_from_cached_plan` will apply the
-            // constraints in order, and the focus atom may have an empty delta, which
-            // will let it bail early.
+            let Some(constraint) = focus(rsb, focus_atom) else {
+                continue;
+            };
+            if rsb.unmatched_rules_mode() == UnmatchedRules::Drop
+                && let Some(Some(key_cols)) = cached_plan.key_joins.get(focus_atom)
+                // Key joins are only kept for two-atom rules.
+                && let (other_table, _) = cached_plan.atom_ts[1 - focus_atom]
+                // The variant would run: an earlier other atom has rows older
+                // than `mid_ts` when nothing has changed it since.
+                && (focus_atom == 0
+                    || mid_epoch.is_some_and(|epoch| !rsb.changed_since(other_table, epoch)))
             {
-                let (_, _, schema_info) = &self.atoms[focus_atom];
-                let ts_col = ColumnId::from_usize(schema_info.ts_col());
-                constraints.push((
-                    cached_plan.atom_mapping[focus_atom],
-                    Constraint::GeConst {
-                        col: ts_col,
-                        val: mid_ts.to_value(),
-                    },
-                ))
+                // The other atom's rows bind the focus atom's key, so the
+                // variant matches only if a new focus row has one of their
+                // keys.
+                let other = cached_plan.atom_mapping[1 - focus_atom];
+                let route = &mut routes[focus_atom];
+                if route
+                    .as_ref()
+                    .is_none_or(|route| rsb.changed_since(other_table, route.epoch))
+                {
+                    *route = Some(Route {
+                        epoch: rsb.change_epoch(),
+                        keys: rsb.small_atom_keys(&cached_plan.plan, other, key_cols),
+                    });
+                }
+                if let Some(keys) = &route.as_ref().unwrap().keys
+                    && !keys.is_empty()
+                    && let (_, focus_constraint) = &constraint
+                    && rsb.any_key_meets(cached_plan.atom_ts[focus_atom].0, focus_constraint, keys)
+                        == Some(false)
+                {
+                    rsb.leave_out(&cached_plan.plan);
+                    continue;
+                }
             }
-            for (i, (_, _, schema_info)) in self.atoms[0..focus_atom].iter().enumerate() {
+            constraints.clear();
+            constraints.push(constraint);
+            for (i, (_, col)) in cached_plan.atom_ts[0..focus_atom].iter().enumerate() {
                 if mid_ts == Timestamp::new(0) {
                     continue 'outer;
                 }
-                let ts_col = ColumnId::from_usize(schema_info.ts_col());
                 constraints.push((
                     cached_plan.atom_mapping[i],
                     Constraint::LtConst {
-                        col: ts_col,
+                        col: *col,
                         val: mid_ts.to_value(),
                     },
                 ));
