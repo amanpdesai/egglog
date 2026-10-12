@@ -55,7 +55,7 @@ rebuild-time congruence (`rebuilding` + `rebuilding_cleanup`), and deferred dele
 (run-schedule
     (saturate
        rebuilding_cleanup ;; cleanup merged rows
-       (saturate single_parent) ;; ensure each term points to single parent
+       (saturate uf_min_index single_parent) ;; ensure each term points to single parent
        (saturate parent) ;; transitively close parent links
        (saturate uf_function_index) ;; mirror UF constructor rows into UF function index
        rebuilding) ;; find new equalities via congruence
@@ -69,6 +69,7 @@ rebuild-time congruence (`rebuilding` + `rebuilding_cleanup`), and deferred dele
 (sort Math)
 (function UF_Math (Math Math) Unit :merge old :internal-hidden)
 (function UF_Mathf (Math) Math :merge new)
+(function UF_Mathmin (Math) Math :merge (ordering-min old new))
 ```
 
 *The union-find* tables for each sort store the equivalence
@@ -88,7 +89,11 @@ When proof tracking is enabled, proofs are stored directly in the UF table
      ((delete (UF_Math a b))
       (set (UF_Math a c) ()))
        :ruleset parent :name "uf_update")
+(rule ((UF_Math a b))
+     ((set (UF_Mathmin a) b))
+       :ruleset uf_min_index :name "uf_min_index")
 (rule ((UF_Math a b)
+      (= c (UF_Mathmin a))
       (UF_Math a c)
       (!= b c)
       (= (ordering-max b c) b))
@@ -104,6 +109,12 @@ When proof tracking is enabled, proofs are stored directly in the UF table
 A couple rules ensure the UF function is kept up to date as
   equalities are added, and the indexing ruleset mirrors those rows
   into the function UF.
+`UF_<Sort>min` (`:merge (ordering-min old new)`) records the smallest parent
+  each term has had. Parents are only ever replaced by smaller ones, so this is
+  the term's smallest current parent, and the single-parent rule points every
+  other parent at it. Pointing them at each other instead makes a term with k
+  parents cost O(k^4) rule matches, each of which allocates proof terms in
+  proof mode.
 We use the `ordering-max` and `ordering-min` egglog primitives
   to define an arbitrary ordering on terms based on insertion order,
   so that we can deterministically choose which term becomes the parent
