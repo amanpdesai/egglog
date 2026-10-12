@@ -2209,8 +2209,12 @@ impl EGraph {
                             .extend(resolved.desugared_before_proofs.clone());
                     }
 
-                    desugared_before_proofs.extend(resolved.desugared_before_proofs);
-                    desugared.extend(resolved.desugared.clone());
+                    // Only resolving returns the desugared program; running
+                    // would otherwise hold every desugared command to the end.
+                    if !run_commands {
+                        desugared_before_proofs.extend(resolved.desugared_before_proofs);
+                        desugared.extend(resolved.desugared.clone());
+                    }
 
                     for processed in resolved.desugared {
                         // even in desugar mode we still run push and pop
