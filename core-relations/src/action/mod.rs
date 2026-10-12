@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 
 use crate::{
     BaseValues, ContainerValues, ExternalFunctionId, Offset, WrappedTable,
-    common::Value,
+    common::{HashMap, Value},
     free_join::{
         CounterId, CounterReservation, Counters, ExternalFunctions, TableId, TableInfo, Variable,
     },
@@ -482,39 +482,44 @@ impl<'db> ExecutionStateSeed<'db, '_> {
 /// tracks if a table has been modified.
 struct MutationBuffers<'a> {
     notify_list: &'a NotificationList<TableId>,
-    buffers: DenseIdMap<TableId, Box<dyn MutationBuffer>>,
+    /// Keyed sparsely: a state writes a few of possibly very many tables, and
+    /// is created, cloned and dropped per action batch.
+    buffers: HashMap<TableId, Box<dyn MutationBuffer>>,
 }
 
 impl Clone for MutationBuffers<'_> {
     fn clone(&self) -> Self {
-        let mut res = MutationBuffers::new(self.notify_list, Default::default());
-        for (id, buf) in self.buffers.iter() {
-            res.buffers.insert(id, buf.fresh_handle());
+        MutationBuffers {
+            notify_list: self.notify_list,
+            buffers: self
+                .buffers
+                .iter()
+                .map(|(id, buf)| (*id, buf.fresh_handle()))
+                .collect(),
         }
-        res
     }
 }
 
 impl<'a> MutationBuffers<'a> {
     fn new(
         notify_list: &'a NotificationList<TableId>,
-        buffers: DenseIdMap<TableId, Box<dyn MutationBuffer>>,
+        mut buffers: DenseIdMap<TableId, Box<dyn MutationBuffer>>,
     ) -> MutationBuffers<'a> {
         MutationBuffers {
             notify_list,
-            buffers,
+            buffers: buffers.drain().collect(),
         }
     }
     fn lazy_init(&mut self, table_id: TableId, f: impl FnOnce() -> Box<dyn MutationBuffer>) {
-        self.buffers.get_or_insert(table_id, f);
+        self.buffers.entry(table_id).or_insert_with(f);
     }
     fn stage_insert(&mut self, table_id: TableId, row: &[Value]) {
-        self.buffers[table_id].stage_insert(row);
+        self.buffers.get_mut(&table_id).unwrap().stage_insert(row);
         self.notify_list.notify(table_id);
     }
 
     fn stage_remove(&mut self, table_id: TableId, key: &[Value]) {
-        self.buffers[table_id].stage_remove(key);
+        self.buffers.get_mut(&table_id).unwrap().stage_remove(key);
         self.notify_list.notify(table_id);
     }
 }
