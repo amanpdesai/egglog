@@ -104,27 +104,29 @@ pub(crate) fn process_actions(
     term_dag: &mut TermDag,
 ) -> Result<ActionContext, ProofCheckError> {
     let mut propositions = HashSet::default();
+    // Terms whose subterms all have reflexive equalities in `propositions`.
+    // Globals bind whole term DAGs, so walking each evaluated term afresh
+    // would revisit every earlier global's DAG.
+    let mut seen = HashSet::default();
+    let mut eval = |expr: &ResolvedExpr,
+                    term_dag: &mut TermDag,
+                    bindings: &HashMap<String, TermId>,
+                    propositions: &mut HashSet<Proposition>| {
+        eval_expr_into(rule_name, expr, term_dag, bindings, propositions, &mut seen)
+    };
 
     // Single pass: process all actions, accumulating bindings and propositions
     for action in actions {
         match action {
             GenericAction::Let(_, var, expr) => {
                 // Evaluate the expression and collect propositions
-                let (term_id, new_props) =
-                    eval_expr_with_subst(rule_name, expr, term_dag, &bindings)?;
+                let term_id = eval(expr, term_dag, &bindings, &mut propositions)?;
                 bindings.insert(var.name.clone(), term_id);
-                propositions.extend(new_props);
             }
             GenericAction::Union(_, lhs_expr, rhs_expr) => {
                 // Union creates ground equalities
-                let (lhs_term, lhs_props) =
-                    eval_expr_with_subst(rule_name, lhs_expr, term_dag, &bindings)?;
-                let (rhs_term, rhs_props) =
-                    eval_expr_with_subst(rule_name, rhs_expr, term_dag, &bindings)?;
-
-                // Collect propositions from evaluating both sides
-                propositions.extend(lhs_props);
-                propositions.extend(rhs_props);
+                let lhs_term = eval(lhs_expr, term_dag, &bindings, &mut propositions)?;
+                let rhs_term = eval(rhs_expr, term_dag, &bindings, &mut propositions)?;
                 // Store both directions of the equality
                 propositions.insert(Proposition::new(lhs_term, rhs_term));
                 propositions.insert(Proposition::new(rhs_term, lhs_term));
@@ -134,14 +136,11 @@ pub(crate) fn process_actions(
                 let mut all_args = args.to_vec();
                 all_args.push(rhs.clone());
                 let call_expr = ResolvedExpr::Call(crate::ast::Span::Panic, func.clone(), all_args);
-                let (_term, new_props) =
-                    eval_expr_with_subst(rule_name, &call_expr, term_dag, &bindings)?;
-                propositions.extend(new_props);
+                eval(&call_expr, term_dag, &bindings, &mut propositions)?;
             }
             GenericAction::Expr(_, expr) => {
                 // Expr creates reflexive equality for its result
-                let (_, new_props) = eval_expr_with_subst(rule_name, expr, term_dag, &bindings)?;
-                propositions.extend(new_props);
+                eval(expr, term_dag, &bindings, &mut propositions)?;
             }
             GenericAction::Panic(_, _) => {
                 // Panics do not create propositions
@@ -169,7 +168,27 @@ fn eval_expr_with_subst(
     subst: &HashMap<String, TermId>,
 ) -> Result<(TermId, HashSet<Proposition>), ProofCheckError> {
     let mut propositions = HashSet::default();
+    let term_id = eval_expr_into(
+        rule_name,
+        expr,
+        dag,
+        subst,
+        &mut propositions,
+        &mut HashSet::default(),
+    )?;
+    Ok((term_id, propositions))
+}
 
+/// [`eval_expr_with_subst`], adding the propositions to `propositions`. Terms
+/// in `seen` already have theirs there and are not walked again.
+fn eval_expr_into(
+    rule_name: &str,
+    expr: &ResolvedExpr,
+    dag: &mut TermDag,
+    subst: &HashMap<String, TermId>,
+    propositions: &mut HashSet<Proposition>,
+    seen: &mut HashSet<TermId>,
+) -> Result<TermId, ProofCheckError> {
     let term_id = match expr {
         ResolvedExpr::Lit(_, lit) => dag.lit(lit.clone()),
         ResolvedExpr::Var(_, var) => subst.get(&var.name).copied().ok_or_else(|| {
@@ -183,9 +202,14 @@ fn eval_expr_with_subst(
             ResolvedCall::Func(_func_type) => {
                 let mut arg_terms = Vec::new();
                 for arg in args {
-                    let (arg_term, arg_props) = eval_expr_with_subst(rule_name, arg, dag, subst)?;
-                    arg_terms.push(arg_term);
-                    propositions.extend(arg_props);
+                    arg_terms.push(eval_expr_into(
+                        rule_name,
+                        arg,
+                        dag,
+                        subst,
+                        propositions,
+                        seen,
+                    )?);
                 }
                 dag.app(head.name().to_string(), arg_terms)
             }
@@ -193,9 +217,14 @@ fn eval_expr_with_subst(
                 // run validator, throwing error if it fails
                 let mut arg_terms = Vec::new();
                 for arg in args {
-                    let (arg_term, arg_props) = eval_expr_with_subst(rule_name, arg, dag, subst)?;
-                    arg_terms.push(arg_term);
-                    propositions.extend(arg_props);
+                    arg_terms.push(eval_expr_into(
+                        rule_name,
+                        arg,
+                        dag,
+                        subst,
+                        propositions,
+                        seen,
+                    )?);
                 }
                 // checked by earlier code showing this program supports proofs
                 let validator = specialized_primitive
@@ -211,27 +240,14 @@ fn eval_expr_with_subst(
     };
 
     // Add reflexive equality for this term and all its subterms
-    add_subterm_reflexive_equalities(term_id, dag, &mut propositions);
+    add_subterm_reflexive_equalities_helper(term_id, dag, propositions, seen);
 
-    Ok((term_id, propositions))
+    Ok(term_id)
 }
 
-/// Add reflexive equalities for all subterms of a term.
+/// Add reflexive equalities for all subterms of a term not in `seen`.
 /// For example, if we have proved `(f (g 1)) = (f (g 1))`, then we have also proved
 // that `(g 1) = (g 1)` and `1 = 1`.
-fn add_subterm_reflexive_equalities(
-    term_id: TermId,
-    term_dag: &TermDag,
-    propositions: &mut HashSet<Proposition>,
-) {
-    add_subterm_reflexive_equalities_helper(
-        term_id,
-        term_dag,
-        propositions,
-        &mut Default::default(),
-    );
-}
-
 fn add_subterm_reflexive_equalities_helper(
     term_id: TermId,
     term_dag: &TermDag,
