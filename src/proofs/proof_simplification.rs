@@ -5,8 +5,63 @@ use crate::{
         proof_checker::{ProofCheckError, gather_globals},
         proof_format::{Justification, Proof, ProofId, ProofStore, Proposition},
     },
-    util::HashMap,
+    util::{HashMap, HashSet},
 };
+
+/// Whether two proof nodes prove the same proposition from the same subproofs.
+fn same_node(a: &Proof, b: &Proof) -> bool {
+    if a.proposition != b.proposition {
+        return false;
+    }
+    match (&a.justification, &b.justification) {
+        (Justification::Fiat, Justification::Fiat) | (Justification::Eval, Justification::Eval) => {
+            true
+        }
+        (
+            Justification::Rule {
+                name: n1,
+                premise_proofs: p1,
+                substitution: s1,
+            },
+            Justification::Rule {
+                name: n2,
+                premise_proofs: p2,
+                substitution: s2,
+            },
+        ) => n1 == n2 && p1 == p2 && s1 == s2,
+        (
+            Justification::MergeFn {
+                function: f1,
+                old_proof: o1,
+                new_proof: w1,
+            },
+            Justification::MergeFn {
+                function: f2,
+                old_proof: o2,
+                new_proof: w2,
+            },
+        ) => f1 == f2 && o1 == o2 && w1 == w2,
+        (Justification::Trans(l1, r1), Justification::Trans(l2, r2)) => l1 == l2 && r1 == r2,
+        (Justification::Sym(i1), Justification::Sym(i2)) => i1 == i2,
+        (
+            Justification::Congr {
+                proof: b1,
+                child_index: c1,
+                child_proof: p1,
+            },
+            Justification::Congr {
+                proof: b2,
+                child_index: c2,
+                child_proof: p2,
+            },
+        ) => b1 == b2 && c1 == c2 && p1 == p2,
+        (
+            Justification::ContainerNormalize { proof: p1 },
+            Justification::ContainerNormalize { proof: p2 },
+        ) => p1 == p2,
+        _ => false,
+    }
+}
 
 impl ProofStore {
     /// Remove globals from a proof by replacing all global variable references
@@ -79,11 +134,39 @@ impl ProofStore {
     ///   order/arity-preserving containers like Vec/Pair, which mint the normalization
     ///   unconditionally, and for already-canonical sets/maps/multisets)
     pub fn simplify(&mut self, proof_id: ProofId) -> ProofId {
+        let mut settled = HashSet::default();
+        self.simplify_tracked(proof_id, &mut settled)
+    }
+
+    /// [`ProofStore::simplify`], skipping proofs known to be settled.
+    ///
+    /// Simplification rewrites proofs in place, and a proof shared by several
+    /// parents is simplified again for every path to it, which is exponential
+    /// in the depth of sharing. A proof is settled once simplifying it changed
+    /// nothing: it returned itself, its node is unchanged, and every child is
+    /// settled. Only simplifying a proof rewrites it, so a settled proof stays
+    /// settled and simplifying it again would change nothing; skipping it
+    /// gives the same result.
+    fn simplify_tracked(&mut self, proof_id: ProofId, settled: &mut HashSet<ProofId>) -> ProofId {
+        if settled.contains(&proof_id) {
+            return proof_id;
+        }
+        let before = self.id_to_proof[proof_id].clone();
+        let mut children_settled = true;
         // First, recursively simplify all child proofs
-        let proof_id = self.map_child_proofs(proof_id, |store, pid| store.simplify(pid));
+        let mapped = self.map_child_proofs(proof_id, |store, pid| {
+            let simplified = store.simplify_tracked(pid, settled);
+            children_settled &= simplified == pid && settled.contains(&pid);
+            simplified
+        });
 
         // Apply local optimizations until fixed point
-        self.simplify_local(proof_id)
+        let result = self.simplify_local(mapped);
+        if result == proof_id && children_settled && same_node(&before, &self.id_to_proof[proof_id])
+        {
+            settled.insert(proof_id);
+        }
+        result
     }
 
     fn simplify_local(&mut self, proof_id: ProofId) -> ProofId {
