@@ -712,41 +712,46 @@ impl Database {
             }
 
             let mut changed = false;
-            let mut tables_merging = DenseIdMap::<
+            // The tables of one stratum to merge, in id order, each with the
+            // info needed to merge it and write buffers pre-allocated for its
+            // declared write dependencies. Sized by the tables merged, not by
+            // every table in the database.
+            let mut tables_merging: Vec<(
                 TableId,
-                (
-                    // The info needed to merge this table.
-                    Option<TableInfo>,
-                    // Pre-allocated write buffers, according to the tables declared write
-                    // dependencies.
-                    DenseIdMap<TableId, Box<dyn MutationBuffer>>,
-                ),
-            >::with_capacity(self.tables.n_ids());
+                Option<TableInfo>,
+                DenseIdMap<TableId, Box<dyn MutationBuffer>>,
+            )> = Vec::with_capacity(to_merge.len());
             for stratum in self.deps.strata() {
                 // Initialize the write dependencies first.
-                for table in stratum.intersection(&to_merge).copied() {
-                    let mut bufs = DenseIdMap::default();
-                    for dep in self.deps.write_deps(table) {
+                tables_merging.extend(
+                    to_merge
+                        .iter()
+                        .copied()
+                        .filter(|table| stratum.contains(table))
+                        .map(|table| (table, None, DenseIdMap::default())),
+                );
+                tables_merging.sort_unstable_by_key(|(table, _, _)| *table);
+                for (table, _, bufs) in tables_merging.iter_mut() {
+                    for dep in self.deps.write_deps(*table) {
                         if let Some(info) = self.tables.get(dep) {
                             bufs.insert(dep, info.table.new_buffer());
                         }
                     }
-                    tables_merging.insert(table, (None, bufs));
                 }
                 // Then initialize read dependencies (this two-phase structure is why we have an
                 // Option in the tables_merging map).
-                for table in stratum.intersection(&to_merge).copied() {
-                    let val = self.tables.unwrap_val(table);
+                for (table, info, _) in tables_merging.iter_mut() {
+                    let val = self.tables.unwrap_val(*table);
                     // Maintain `total_size_estimate` incrementally (subtract now, add
                     // the post-merge length on drain below) so the reset loop no
                     // longer re-sums every table.
                     self.total_size_estimate =
                         self.total_size_estimate.wrapping_sub(val.table.len());
-                    tables_merging[table].0 = Some(val);
+                    *info = Some(val);
                 }
                 let db = self.read_only_view();
                 changed |= if do_parallel {
-                    parallel::map_dense_id_map_mut(&mut tables_merging, |_, (info, buffers)| {
+                    parallel::map_mut(&mut tables_merging, |_, (_, info, buffers)| {
                         let mut es = ExecutionState::new(db, mem::take(buffers));
                         info.as_mut().unwrap().table.merge(&mut es).added || es.changed
                     })
@@ -755,14 +760,14 @@ impl Database {
                 } else {
                     tables_merging
                         .iter_mut()
-                        .map(|(_, (info, buffers))| {
+                        .map(|(_, info, buffers)| {
                             let mut es = ExecutionState::new(db, mem::take(buffers));
                             info.as_mut().unwrap().table.merge(&mut es).added || es.changed
                         })
                         .max()
                         .unwrap_or(false)
                 };
-                for (id, (table, _)) in tables_merging.drain() {
+                for (id, table, _) in tables_merging.drain(..) {
                     let val = table.unwrap();
                     self.total_size_estimate =
                         self.total_size_estimate.wrapping_add(val.table.len());
