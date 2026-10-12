@@ -12,6 +12,8 @@ use crate::{ArcSort, EGraph, Value};
 struct RootExtractor {
     cache: HashMap<(Value, String), Option<TermId>>,
     active: HashSet<(Value, String)>,
+    // Rows of each constructor keyed by output value, in scan order.
+    rows_by_output: HashMap<String, HashMap<Value, Vec<Vec<Value>>>>,
 }
 
 impl RootExtractor {
@@ -19,6 +21,7 @@ impl RootExtractor {
         Self {
             cache: Default::default(),
             active: Default::default(),
+            rows_by_output: Default::default(),
         }
     }
 
@@ -102,14 +105,24 @@ impl RootExtractor {
             }
 
             let output_idx = func.extraction_output_index();
-            let mut matching_rows = Vec::new();
-            egraph
-                .backend
-                .for_each(func.backend_id, |row: egglog_bridge::ScanEntry| {
-                    if !row.subsumed && row.vals[output_idx] == value {
-                        matching_rows.push(row.vals.to_vec());
-                    }
+            let index = self
+                .rows_by_output
+                .entry(func.decl.name.to_string())
+                .or_insert_with(|| {
+                    let mut index: HashMap<Value, Vec<Vec<Value>>> = Default::default();
+                    egraph
+                        .backend
+                        .for_each(func.backend_id, |row: egglog_bridge::ScanEntry| {
+                            if !row.subsumed {
+                                index
+                                    .entry(row.vals[output_idx])
+                                    .or_default()
+                                    .push(row.vals.to_vec());
+                            }
+                        });
+                    index
                 });
+            let matching_rows = index.get(&value).cloned().unwrap_or_default();
 
             for row in matching_rows {
                 let num_children = func.extraction_num_children();
