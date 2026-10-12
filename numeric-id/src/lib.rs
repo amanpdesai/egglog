@@ -89,7 +89,12 @@ impl<K, V> Default for DenseIdMap<K, V> {
 impl<K: NumericId, V> DenseIdMap<K, V> {
     /// Create an empty map with space for `n` entries pre-allocated.
     pub fn with_capacity(n: usize) -> Self {
-        let mut res = Self::new();
+        // Allocate exactly `n` slots: growing an empty `Vec` to `n` would
+        // round small requests up to four slots.
+        let mut res = Self {
+            data: Vec::with_capacity(n),
+            _marker: PhantomData,
+        };
         res.reserve_space(K::from_usize(n.saturating_sub(1)));
         res
     }
