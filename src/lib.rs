@@ -1171,12 +1171,41 @@ impl EGraph {
         let mut rule_ids = Vec::new();
         collect_rule_ids(ruleset, &self.rulesets, &mut rule_ids);
 
-        let iteration_report = self
+        let mut iteration_report = self
             .backend
             .run_rules(&rule_ids, Some(&self.type_info))
             .map_err(|e| Error::BackendError(e.to_string()))?;
 
+        // The term encoding's maintenance rulesets hold rules for every
+        // function and run after every command, so a report entry per rule
+        // per run grows with commands times functions. Keep the rules that
+        // matched.
+        if self.is_encoding_ruleset(ruleset) {
+            let rule_reports = &mut iteration_report.rule_set_report.rule_reports;
+            rule_reports.retain(|_, reports| reports.iter().any(|r| r.num_matches > 0));
+            rule_reports.shrink_to_fit();
+        }
+
         Ok(RunReport::singleton(ruleset, iteration_report))
+    }
+
+    /// Whether `ruleset` is one of the maintenance rulesets the term encoding adds.
+    fn is_encoding_ruleset(&self, ruleset: &str) -> bool {
+        if self.proof_state.original_typechecking.is_none() {
+            return false;
+        }
+        let names = &self.proof_state.proof_names;
+        [
+            &names.path_compress_ruleset_name,
+            &names.single_parent_ruleset_name,
+            &names.uf_min_ruleset_name,
+            &names.uf_function_index_ruleset_name,
+            &names.rebuilding_ruleset_name,
+            &names.rebuilding_cleanup_ruleset_name,
+            &names.delete_subsume_ruleset_name,
+        ]
+        .into_iter()
+        .any(|name| name == ruleset)
     }
 
     fn add_rule(&mut self, rule: ast::ResolvedRule) -> Result<String, Error> {
