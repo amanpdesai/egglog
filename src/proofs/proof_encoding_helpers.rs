@@ -42,6 +42,7 @@ pub(crate) struct EncodingNames {
     pub(crate) rebuilding_ruleset_name: String,
     pub(crate) rebuilding_cleanup_ruleset_name: String,
     pub(crate) delete_subsume_ruleset_name: String,
+    pub(crate) uf_min_ruleset_name: String,
     // Per-function fresh names
     pub(crate) view_name: HashMap<String, String>,
     pub(crate) to_delete_name: HashMap<String, String>,
@@ -83,6 +84,7 @@ impl EncodingNames {
             rebuilding_ruleset_name: symbol_gen.fresh("rebuilding"),
             rebuilding_cleanup_ruleset_name: symbol_gen.fresh("rebuilding_cleanup"),
             delete_subsume_ruleset_name: symbol_gen.fresh("delete_subsume_ruleset"),
+            uf_min_ruleset_name: symbol_gen.fresh("uf_min_index"),
             view_name: HashMap::default(),
             to_delete_name: HashMap::default(),
             subsumed_name: HashMap::default(),
@@ -156,13 +158,15 @@ impl ProofInstrumentor<'_> {
              (ruleset {})
              (ruleset {})
              (ruleset {})
+             (ruleset {})
              (ruleset {})",
             self.proof_names().path_compress_ruleset_name,
             self.proof_names().single_parent_ruleset_name,
             self.proof_names().uf_function_index_ruleset_name,
             self.proof_names().rebuilding_ruleset_name,
             self.proof_names().rebuilding_cleanup_ruleset_name,
-            self.proof_names().delete_subsume_ruleset_name
+            self.proof_names().delete_subsume_ruleset_name,
+            self.proof_names().uf_min_ruleset_name
         );
         self.parse_program(&str)
     }

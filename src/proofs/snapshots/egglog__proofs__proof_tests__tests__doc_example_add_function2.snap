@@ -8,6 +8,7 @@ expression: snapshot
 (ruleset __rebuilding)
 (ruleset __rebuilding_cleanup)
 (ruleset __delete_subsume_ruleset)
+(ruleset __uf_min_index)
 (sort __view)
 (constructor add (i64 i64 i64) __view :unextractable :internal-hidden)
 (function __addView (i64 i64 i64) Unit :merge old :unextractable :internal-term-constructor add)
@@ -48,4 +49,4 @@ expression: snapshot
         :ruleset __delete_subsume_ruleset :name "__delete_rule_subsume")
 (check (= __v (__addView 0 0 __n))
 (= __n 0))
-(run-schedule (seq (saturate (seq (run __rebuilding_cleanup) (saturate (run __single_parent)) (saturate (run __parent)) (saturate (run __uf_function_index)) (run __rebuilding))) (run __delete_subsume_ruleset)))
+(run-schedule (seq (saturate (seq (run __rebuilding_cleanup) (saturate (seq (run __uf_min_index) (run __single_parent))) (saturate (run __parent)) (saturate (run __uf_function_index)) (run __rebuilding))) (run __delete_subsume_ruleset)))

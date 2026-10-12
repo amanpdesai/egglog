@@ -131,6 +131,13 @@ impl<'a> ProofInstrumentor<'a> {
         }
         let pname = self.uf_name(sort_name);
         let uf_function_name = self.uf_function_name(sort_name);
+        let uf_min_name = self
+            .egraph
+            .parser
+            .symbol_gen
+            .fresh(&format!("UF_{sort_name}min"));
+        let uf_min_rule_name = self.egraph.parser.symbol_gen.fresh("uf_min_index");
+        let uf_min_ruleset_name = self.proof_names().uf_min_ruleset_name.clone();
         let fresh_name = self.egraph.parser.symbol_gen.fresh("uf_update");
         let uf_function_index_name = self.egraph.parser.symbol_gen.fresh("uf_function_index");
         // Fresh query-variable names for the UF maintenance rules. These must be
@@ -167,6 +174,7 @@ impl<'a> ProofInstrumentor<'a> {
                     ),
                     format!(
                         "(= {p1_fresh} ({pname} {a} {b}))
+                        (= {c} ({uf_min_name} {a}))
                         (= {p2_fresh} ({pname} {a} {c}))"
                     ),
                     format!(
@@ -180,7 +188,9 @@ impl<'a> ProofInstrumentor<'a> {
                     format!(
                         "(delete ({pname} {a} {b}))\n                       (set ({pname} {a} {c}) ())"
                     ),
-                    format!("({pname} {a} {b})\n                        ({pname} {a} {c})"),
+                    format!(
+                        "({pname} {a} {b})\n                        (= {c} ({uf_min_name} {a}))\n                        ({pname} {a} {c})"
+                    ),
                     format!(
                         "(delete ({pname} {a} {b}))\n                       (set ({pname} {b} {c}) ())"
                     ),
@@ -208,9 +218,22 @@ impl<'a> ProofInstrumentor<'a> {
                 )
             };
 
+        let uf_min_query = if self.egraph.proof_state.proofs_enabled {
+            let proof_fresh = self.egraph.parser.symbol_gen.fresh("uf_min_proof");
+            format!("(= {proof_fresh} ({pname} {a} {b}))")
+        } else {
+            format!("({pname} {a} {b})")
+        };
+
         let mut code = format!(
             "{uf_pair_sort_decl}
              (function {pname} ({sort_name} {sort_name}) {proof_type} :merge old :internal-hidden)
+             ;; the smallest parent each term has had, which is its smallest current parent
+             (function {uf_min_name} ({sort_name}) {sort_name} :merge (ordering-min old new) :unextractable :internal-hidden)
+             (rule ({uf_min_query})
+                   ((set ({uf_min_name} {a}) {b}))
+                   :ruleset {uf_min_ruleset_name}
+                   :name \"{uf_min_rule_name}\")
              (function {uf_function_name} ({sort_name}) {uf_function_output_type} :merge new :unextractable :internal-hidden)
              ;; performs path compression, ensuring each term points to the representative
              (rule ({path_compress_query}
@@ -218,7 +241,8 @@ impl<'a> ProofInstrumentor<'a> {
                   ({path_compress_action})
                    :ruleset {path_compress_ruleset_name}
                    :name \"{fresh_name}\")
-             ;; ensures each term has only one parent
+             ;; ensures each term has only one parent: every other parent
+             ;; of a term is pointed at its smallest parent
              (rule ({single_parent_query}
                     (!= {b} {c})
                     (= (ordering-max {b} {c}) {b}))
@@ -1456,6 +1480,7 @@ impl<'a> ProofInstrumentor<'a> {
     fn rebuild(&mut self) -> Schedule {
         let path_compress_ruleset = self.proof_names().path_compress_ruleset_name.clone();
         let single_parent = self.proof_names().single_parent_ruleset_name.clone();
+        let uf_min = self.proof_names().uf_min_ruleset_name.clone();
         let uf_function_index = self.proof_names().uf_function_index_ruleset_name.clone();
         let rebuilding_cleanup_ruleset = self.proof_names().rebuilding_cleanup_ruleset_name.clone();
         let rebuilding_ruleset = self.proof_names().rebuilding_ruleset_name.clone();
@@ -1464,7 +1489,7 @@ impl<'a> ProofInstrumentor<'a> {
             "(seq
               (saturate
                   {rebuilding_cleanup_ruleset}
-                  (saturate {single_parent})
+                  (saturate {uf_min} {single_parent})
                   (saturate {path_compress_ruleset})
                   (saturate {uf_function_index})
                   {rebuilding_ruleset})
